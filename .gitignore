@@ -22,6 +22,9 @@
 *.dylib
 *.dll
 *.so.*
+.venv
+.idea
+cpp/cmake-build-*
 
 
 # Fortran module files
