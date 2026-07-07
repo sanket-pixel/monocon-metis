@@ -19,10 +19,10 @@ namespace monocon {
 
     // Direct C++ port of python/model/decode.py's decode_predictions().
     // topk=30, num_alpha_bins=12, num_kpts=9 hardcoded, matching head.py.
-    std::vector<Detection> decode_predictions(
-        const std::map<std::string, HeadOutput>& pred,
-        const ProjMatrix& P2,
-        int img_h, int img_w,
-        float score_thres = 0.3f);
+std::vector<Detection> decode_predictions(
+    const HeadRuntime& head,
+    const ProjMatrix& P2,
+    int img_h, int img_w,
+    float score_thres = 0.3f);
 
 } // namespace monocon

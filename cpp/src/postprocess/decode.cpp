@@ -151,87 +151,86 @@ namespace monocon {
     } // anonymous
 
     std::vector<Detection> decode_predictions(
-        const std::map<std::string, HeadOutput>& pred,
-        const ProjMatrix& P2,
-        int img_h, int img_w,
-        float score_thres) {
+    const HeadRuntime& head,
+    const ProjMatrix& P2,
+    int img_h, int img_w,
+    float score_thres) {
 
-        const auto& heatmap_out = pred.at("center_heatmap");
-        const int num_classes = static_cast<int>(heatmap_out.shape[1]);
-        const int feat_h = static_cast<int>(heatmap_out.shape[2]);
-        const int feat_w = static_cast<int>(heatmap_out.shape[3]);
-        const int HW = feat_h * feat_w;
+    const auto& heatmap_out = head.output("center_heatmap");
+    const int num_classes = static_cast<int>(heatmap_out.shape[1]);
+    const int feat_h = static_cast<int>(heatmap_out.shape[2]);
+    const int feat_w = static_cast<int>(heatmap_out.shape[3]);
+    const int HW = feat_h * feat_w;
 
-        auto heat_nms = local_maximum(heatmap_out.data, num_classes, feat_h, feat_w);
-        auto topk = get_topk(heat_nms, num_classes, feat_h, feat_w, TOPK);
+    auto heat_nms = local_maximum(heatmap_out.data, num_classes, feat_h, feat_w);
+    auto topk = get_topk(heat_nms, num_classes, feat_h, feat_w, TOPK);
 
-        const auto& wh = pred.at("wh").data;
-        const auto& offset = pred.at("offset").data;
-        const auto& alpha_cls_all = pred.at("alpha_cls").data;
-        const auto& alpha_offset_all = pred.at("alpha_offset").data;
-        const auto& depth_all = pred.at("depth").data;
-        const auto& kpt_offset_all = pred.at("center2kpt_offset").data;
-        const auto& dim_all = pred.at("dim").data;
+    const auto& wh = head.output("wh").data;
+    const auto& offset = head.output("offset").data;
+    const auto& alpha_cls_all = head.output("alpha_cls").data;
+    const auto& alpha_offset_all = head.output("alpha_offset").data;
+    const auto& depth_all = head.output("depth").data;
+    const auto& kpt_offset_all = head.output("center2kpt_offset").data;
+    const auto& dim_all = head.output("dim").data;
 
-        const float x_scale = static_cast<float>(img_w) / feat_w;
-        const float y_scale = static_cast<float>(img_h) / feat_h;
+    const float x_scale = static_cast<float>(img_w) / feat_w;
+    const float y_scale = static_cast<float>(img_h) / feat_h;
 
-        std::vector<Detection> detections;
+    std::vector<Detection> detections;
 
-        for (int k = 0; k < static_cast<int>(topk.scores.size()); ++k) {
-            const int pixel_idx = topk.pixel_idx[k];
-            const int y = topk.ys[k], x = topk.xs[k];
+    for (int k = 0; k < static_cast<int>(topk.scores.size()); ++k) {
+        const int pixel_idx = topk.pixel_idx[k];
+        const int y = topk.ys[k], x = topk.xs[k];
 
-            auto wh_k = gather_channels(wh, 2, HW, pixel_idx);
-            auto offset_k = gather_channels(offset, 2, HW, pixel_idx);
+        auto wh_k = gather_channels(wh, 2, HW, pixel_idx);
+        auto offset_k = gather_channels(offset, 2, HW, pixel_idx);
 
-            const float cx = x + offset_k[0];
-            const float cy = y + offset_k[1];
+        const float cx = x + offset_k[0];
+        const float cy = y + offset_k[1];
 
-            const float x1 = (cx - wh_k[0] / 2.f) * x_scale;
-            const float y1 = (cy - wh_k[1] / 2.f) * y_scale;
-            const float x2 = (cx + wh_k[0] / 2.f) * x_scale;
-            const float y2 = (cy + wh_k[1] / 2.f) * y_scale;
+        const float x1 = (cx - wh_k[0] / 2.f) * x_scale;
+        const float y1 = (cy - wh_k[1] / 2.f) * y_scale;
+        const float x2 = (cx + wh_k[0] / 2.f) * x_scale;
+        const float y2 = (cy + wh_k[1] / 2.f) * y_scale;
 
-            auto alpha_cls_k = gather_channels(alpha_cls_all, NUM_ALPHA_BINS, HW, pixel_idx);
-            auto alpha_offset_k = gather_channels(alpha_offset_all, NUM_ALPHA_BINS, HW, pixel_idx);
-            const float alpha = decode_alpha(alpha_cls_k, alpha_offset_k);
+        auto alpha_cls_k = gather_channels(alpha_cls_all, NUM_ALPHA_BINS, HW, pixel_idx);
+        auto alpha_offset_k = gather_channels(alpha_offset_all, NUM_ALPHA_BINS, HW, pixel_idx);
+        const float alpha = decode_alpha(alpha_cls_k, alpha_offset_k);
 
-            auto depth_k = gather_channels(depth_all, 2, HW, pixel_idx);
-            const float depth_val = depth_k[0];
-            const float depth_confidence = std::exp(-depth_k[1]);
+        auto depth_k = gather_channels(depth_all, 2, HW, pixel_idx);
+        const float depth_val = depth_k[0];
+        const float depth_confidence = std::exp(-depth_k[1]);
 
-            float score = topk.scores[k] * depth_confidence;
-            if (score <= score_thres) continue;
+        float score = topk.scores[k] * depth_confidence;
+        if (score <= score_thres) continue;
 
-            auto kpt_offset_k = gather_channels(kpt_offset_all, NUM_KPTS * 2, HW, pixel_idx);
-            // last keypoint pair = projected 3D center, per decode.py
-            const float center_x = (kpt_offset_k[(NUM_KPTS - 1) * 2] + x) * x_scale;
-            const float center_y = (kpt_offset_k[(NUM_KPTS - 1) * 2 + 1] + y) * y_scale;
+        auto kpt_offset_k = gather_channels(kpt_offset_all, NUM_KPTS * 2, HW, pixel_idx);
+        const float center_x = (kpt_offset_k[(NUM_KPTS - 1) * 2] + x) * x_scale;
+        const float center_y = (kpt_offset_k[(NUM_KPTS - 1) * 2 + 1] + y) * y_scale;
 
-            const float rot_y = alpha_to_rotation_y(center_x, alpha, P2);
-            const auto center3d = image_to_camera_3d(center_x, center_y, depth_val, P2);
+        const float rot_y = alpha_to_rotation_y(center_x, alpha, P2);
+        const auto center3d = image_to_camera_3d(center_x, center_y, depth_val, P2);
 
-            auto dim_k = gather_channels(dim_all, 3, HW, pixel_idx);
+        auto dim_k = gather_channels(dim_all, 3, HW, pixel_idx);
 
-            Box3D box3d{
-                center3d[0], center3d[1], center3d[2],
-                dim_k[0], dim_k[1], dim_k[2],
-                rot_y};
+        Box3D box3d{
+            center3d[0], center3d[1], center3d[2],
+            dim_k[0], dim_k[1], dim_k[2],
+            rot_y};
 
-            // KITTI bottom-center origin fix: shift up by half height
-            box3d.y += box3d.height * 0.5f;
+        box3d.y += box3d.height * 0.5f;
 
-            Detection det;
-            det.class_id = topk.classes[k];
-            det.score = score;
-            det.box2d = {x1, y1, x2, y2};
-            det.box3d = box3d;
+        Detection det;
+        det.class_id = topk.classes[k];
+        det.score = score;
+        det.box2d = {x1, y1, x2, y2};
+        det.box3d = box3d;
 
-            detections.push_back(det);
-        }
-
-        return detections;
+        detections.push_back(det);
     }
+
+    return detections;
+}
+  
 
 } // namespace monocon

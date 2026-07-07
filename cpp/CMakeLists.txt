@@ -46,7 +46,7 @@ endif ()
 message(STATUS "  AxRuntime   : ${AXRUNTIME_ROOT}")
 
 find_package(OpenCV REQUIRED)
-
+find_package(OpenMP REQUIRED)
 # ──────────────────────────────────────────────
 # ONNXRuntime (from Voyager SDK bundle)
 # ──────────────────────────────────────────────
@@ -113,6 +113,7 @@ set(MONOCON_SOURCES
 
         # inference
         src/inference/aipu_inference.cpp
+        src/inference/onnx_inference.cpp
         src/inference/backbone_neck.cpp
         src/inference/head.cpp
 
@@ -142,7 +143,7 @@ target_link_libraries(monocon_cpp
         onnxruntime::onnxruntime
         axruntime::axruntime
 )
-
+target_link_libraries(monocon_cpp PUBLIC OpenMP::OpenMP_CXX)
 # ──────────────────────────────────────────────
 # Executable
 # ──────────────────────────────────────────────

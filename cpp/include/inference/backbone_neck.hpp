@@ -3,25 +3,25 @@
 #include "inference/aipu_inference.hpp"
 #include "preprocess/opencv_preprocess.hpp"
 
-#include <memory>
 #include <string>
 
 namespace monocon {
 
-    // Thin, model-specific wrapper around AipuInference — this is the
-    // clean entry point the rest of the pipeline calls: hand it a
-    // preprocessed float image, get back the raw int8 AIPU output +
-    // the tensor info needed to dequantize it (done in postprocess/, not here).
+    // Thin, model-specific wrapper around AipuInference: quantizes a
+    // preprocessed image into the AIPU's input buffer and runs inference.
+    // After forward()/forward_timed() returns, read results via
+    // output_buffer(i) for i in [0, output_count()) — positional, in the
+    // compiled model's declared output order.
     class BackboneNeck {
     public:
-        explicit BackboneNeck(const std::string& compiled_model_dir, int num_cores = 4);
+        explicit BackboneNeck(const std::string& compiled_model_dir, int num_cores = 1);
 
-        // Runs quantize -> AIPU inference. Returns a pointer to the raw
-        // int8 output buffer (owned internally, valid until next call)
-        // plus the tensor info needed to dequantize it.
-        const int8_t* forward(const PreprocessedImage& image);
+        void forward(const PreprocessedImage& image);
+        void forward_timed(const PreprocessedImage& image, double& quantize_ms, double& aipu_ms);
 
-        const AipuTensorInfo& output_info() const { return aipu_.output_info(0); }
+        int output_count() const { return aipu_.output_count(); }
+        const AipuTensorInfo& output_info(int index) const { return aipu_.output_info(index); }
+        const int8_t* output_buffer(int index) const { return aipu_.output_buffer(index); }
         const AipuTensorInfo& input_info() const { return aipu_.input_info(0); }
 
     private:

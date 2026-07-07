@@ -1,61 +1,48 @@
 #pragma once
 
-#include <onnxruntime_cxx_api.h>
+#include "inference/onnx_inference.hpp"
 
-#include <map>
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace monocon {
 
-    // Lightweight named tensor — owns its own float buffer, bound directly
-    // into an Ort::Value at construction so ORT reads/writes this memory
-    // in place, no per-frame Ort::Value allocation.
-    struct BoundTensor {
-        std::string name;
-        std::vector<int64_t> shape;
-        std::vector<float> data;
-
-        size_t numel() const {
-            size_t n = 1;
-            for (auto d : shape) n *= static_cast<size_t>(d);
-            return n;
-        }
-    };
-    using HeadOutput = BoundTensor;
-    // Runs monocon_head.onnx via ONNXRuntime CPU, using IoBinding so all
-    // input/output tensors are allocated ONCE at construction, not per-frame.
-    // forward() just writes into the bound input buffer and calls Run().
+    // Fixed order used by python/model/export.py's HeadTailWrapper and
+    // BackboneNeckConv1's export — both AIPU output order and HeadTail
+    // ONNX input order follow this exactly. Real ONNX input tensor NAMES
+    // may be exporter-mangled (e.g. "wh" -> "wh.1") and must NOT be relied
+    // on directly — only their POSITION in this fixed order is trustworthy.
+    // Order HeadTail's ONNX graph was EXPORTED with — this is what
+    // onnx_.input_names() (positionally) corresponds to. Untouched by the
+    // AIPU compiler, since HeadTail was never compiled for the AIPU.
+      constexpr std::array<const char*, 9> HEAD_NAMES = {
+        "heatmap", "wh", "offset", "center2kpt_offset",
+        "kpt_heatmap", "kpt_heatmap_offset", "dim", "depth", "dir_feat"};
+    // MonoCon-specific wrapper around OnnxInference for the HeadTail model.
+    // Takes HeadConv1's 9 dequantized feature maps (each 64 x feat_h x feat_w,
+    // in HEAD_NAMES order) and produces the 10 final named prediction tensors
+    // decode.cpp expects.
     class HeadRuntime {
     public:
         explicit HeadRuntime(const std::string& onnx_path, int intra_op_threads = 4);
 
-        // Writes `feat` into the bound input tensor and runs inference.
-        // Returns a reference to internal output tensors — valid until the
-        // next forward() call, no copying needed by the caller.
-        const std::map<std::string, BoundTensor>& forward(
-            const std::vector<float>& feat, int64_t feat_h, int64_t feat_w);
+        // conv1_outputs: 9 tensors in HEAD_NAMES order, each a flat
+        // (64 * feat_h * feat_w) float buffer.
+        void forward(const std::vector<std::vector<float>>& conv1_outputs,
+                    int64_t feat_h, int64_t feat_w);
 
-        const BoundTensor& output(const std::string& name) const { return outputs_.at(name); }
+        // Final output access — these ARE the real, unmangled ONNX output
+        // names (confirmed clean in the exported graph: center_heatmap,
+        // wh, offset, ... no suffixing), safe to use directly.
+        const BoundTensor& output(const std::string& name) const { return onnx_.output(name); }
 
     private:
-        Ort::Env env_;
-        std::unique_ptr<Ort::Session> session_;
-        std::unique_ptr<Ort::IoBinding> io_binding_;
-        Ort::MemoryInfo memory_info_;
+        OnnxInference onnx_;
+        bool inputs_bound_ = false;
 
-        std::vector<Ort::AllocatedStringPtr> input_name_holders_;
-        std::vector<Ort::AllocatedStringPtr> output_name_holders_;
-
-        BoundTensor input_;
-        std::vector<Ort::Value> ort_input_values_;   // kept alive, bound once
-
-        std::map<std::string, BoundTensor> outputs_;
-        std::vector<Ort::Value> ort_output_values_;  // kept alive, bound once
-
-        int64_t bound_feat_h_ = 0;
-        int64_t bound_feat_w_ = 0;
+        void bind_inputs_once(int64_t feat_h, int64_t feat_w);
     };
 
 } // namespace monocon
