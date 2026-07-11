@@ -4,7 +4,7 @@ End-to-end 3D object detection from a single camera, running entirely on an
 Axelera Metis M.2 AIPU single core + CPU host, no GPU required at inference time
 Running at 24.5 FPS end to end with single core, no latency , no batching.
 
-![Demo](data/kitti.gif)
+<img src="data/kitti.webp" alt="MonoCon Demo" width="100%">
 
 ## Features
 
