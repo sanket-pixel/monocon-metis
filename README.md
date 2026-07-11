@@ -395,3 +395,15 @@ approaches `max(31 ms, 29 ms) ≈ 31 ms/frame`.
 improvement** over the already-optimised sequential baseline, from the
 same hardware with no changes to any individual stage.
 
+## References
+
+- **MonoCon: Learning Auxiliary Monocular Contexts Helps Monocular 3D Object Detection (AAAI 2022)**
+  Liu et al. · [Paper](https://arxiv.org/abs/2112.04628) · [PyTorch Implementation](https://github.com/2gunsu/monocon-pytorch)
+
+- **Axelera Voyager SDK**
+  Compiler, runtime, and toolchain for the Metis AIPU ·
+  [GitHub](https://github.com/axelera-ai-hub/voyager-sdk)
+
+- **Axelera Metis M.2**
+  Edge AI accelerator used for all measurements in this project ·
+  [Product page](https://store.axelera.ai/products/metis-m-2-card-the-most-performant-m-2-edge-ai-accelerator)
