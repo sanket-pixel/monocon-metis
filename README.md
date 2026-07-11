@@ -16,7 +16,7 @@ Running at 24.5 FPS end to end with single core, no latency , no batching.
 - [x] `make export / compile / build / run / profile / video` — full pipeline in one command
 - [x] Verified numerically at every split point against FP32 PyTorch reference
 
-## 1. Results
+## Results
 
 **Hardware:** AMD Ryzen desktop + Axelera Metis M.2 PCIe · 1 AIPU core · CPU host
 
@@ -45,7 +45,7 @@ computation, while the AIPU processes frame N+1, the CPU decodes frame N.
 | Producer-consumer pipeline | **24.5** | AIPU/CPU overlap across frames |
 
 
-## 2. Architecture
+##  Architecture
 
 The pipeline splits cleanly at the AIPU/CPU boundary, forced by a hard
 compiler constraint: `AttnBatchNorm2d` contains a `ReduceMean` op that
@@ -133,7 +133,7 @@ Since AIPU time (~31 ms) and CPU time (~29 ms) are nearly matched, the
 pipeline runs at `max(31, 29) ≈ 31 ms/frame` sustained — **24.5 FPS**
 over 433 frames.
 
-## 3. Setup
+## Setup
 
 ### Prerequisites
 
