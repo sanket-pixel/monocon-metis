@@ -23,24 +23,48 @@ namespace monocon {
         const int64_t pad_w_before = tensor_info.padding[2].first;
         const int64_t pad_c_before = tensor_info.padding[3].first;
 
-        const double scale = tensor_info.scale;
-        const int zero_point = tensor_info.zero_point;
+        const float scale = static_cast<float>(tensor_info.scale);
+        const float neg_zp_scale = -static_cast<float>(tensor_info.zero_point) * scale;
 
-        // Only resize if needed — after the first call, this is a no-op,
-        // so no repeated allocation once shapes stabilize.
         const size_t needed = static_cast<size_t>(N * C * H * W);
         if (out.size() != needed) out.resize(needed);
 
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t h = 0; h < H; ++h) {
-                for (int64_t w = 0; w < W; ++w) {
-                    for (int64_t c = 0; c < C; ++c) {
-                        const int64_t src_h = h + pad_h_before;
-                        const int64_t src_w = w + pad_w_before;
+        float* const out_ptr = out.data();
+        const int64_t HW = H * W;
+
+        // Parallelize over rows — same pattern that worked for the 9
+        // separate-tensor case, just applied within this one bigger call.
+        // C is now 576, not 64, so each row does 9x more work than before —
+        // still splits cleanly across cores.
+        const int64_t BLOCK = 32;
+
+        // Parallelize over rows
+#pragma omp parallel for schedule(static)
+        for (int64_t h = 0; h < H; ++h) {
+            const int64_t src_h = h + pad_h_before;
+
+            // Tile over Channels
+            for (int64_t c_blk = 0; c_blk < C; c_blk += BLOCK) {
+                const int64_t c_end = std::min(c_blk + BLOCK, C);
+
+                // Tile over Width
+                for (int64_t w_blk = 0; w_blk < W; w_blk += BLOCK) {
+                    const int64_t w_end = std::min(w_blk + BLOCK, W);
+
+                    // Inside this block, everything is cached!
+                    for (int64_t c = c_blk; c < c_end; ++c) {
+                        float* const channel_out_row = out_ptr + c * HW + h * W;
                         const int64_t src_c = c + pad_c_before;
-                        const int64_t src_idx = ((n * padded_H + src_h) * padded_W + src_w) * padded_C + src_c;
-                        const int64_t dst_idx = ((n * C + c) * H + h) * W + w;
-                        out[dst_idx] = static_cast<float>((static_cast<double>(raw_output[src_idx]) - zero_point) * scale);
+
+                        #pragma omp simd
+                        for (int64_t w = w_blk; w < w_end; ++w) {
+                            const int64_t src_w = w + pad_w_before;
+                            const int8_t src_val = raw_output[(src_h * padded_W + src_w) * padded_C + src_c];
+
+                            // Contiguous write. The strided read is now safe because
+                            // the surrounding data is still living in the L1 cache!
+                            channel_out_row[w] = static_cast<float>(src_val) * scale + neg_zp_scale;
+                        }
                     }
                 }
             }

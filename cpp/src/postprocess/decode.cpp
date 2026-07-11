@@ -150,28 +150,69 @@ namespace monocon {
         }
     } // anonymous
 
-    std::vector<Detection> decode_predictions(
-    const HeadRuntime& head,
+    float iou_2d(const std::array<float, 4>& a, const std::array<float, 4>& b) {
+        const float inter_x1 = std::max(a[0], b[0]);
+        const float inter_y1 = std::max(a[1], b[1]);
+        const float inter_x2 = std::min(a[2], b[2]);
+        const float inter_y2 = std::min(a[3], b[3]);
+
+        const float inter_w = std::max(0.0f, inter_x2 - inter_x1);
+        const float inter_h = std::max(0.0f, inter_y2 - inter_y1);
+        const float inter_area = inter_w * inter_h;
+
+        if (inter_area == 0.0f) return 0.0f;
+
+        const float area_a = (a[2] - a[0]) * (a[3] - a[1]);
+        const float area_b = (b[2] - b[0]) * (b[3] - b[1]);
+        return inter_area / (area_a + area_b - inter_area);
+    }
+
+    std::vector<Detection> nms(std::vector<Detection> dets, float iou_threshold) {
+        // Sort by score descending — already done by topk, but be explicit.
+        std::sort(dets.begin(), dets.end(),
+                  [](const Detection& a, const Detection& b) { return a.score > b.score; });
+
+        std::vector<bool> suppressed(dets.size(), false);
+        std::vector<Detection> kept;
+
+        for (size_t i = 0; i < dets.size(); ++i) {
+            if (suppressed[i]) continue;
+            kept.push_back(dets[i]);
+
+            for (size_t j = i + 1; j < dets.size(); ++j) {
+                if (suppressed[j]) continue;
+                // Only suppress within the same class
+                if (dets[i].class_id != dets[j].class_id) continue;
+                if (iou_2d(dets[i].box2d, dets[j].box2d) > iou_threshold) {
+                    suppressed[j] = true;
+                }
+            }
+        }
+        return kept;
+    }
+
+ std::vector<Detection> decode_predictions(
+    const std::map<std::string, std::vector<float>>& pred,
     const ProjMatrix& P2,
     int img_h, int img_w,
+    int feat_h, int feat_w,
     float score_thres) {
 
-    const auto& heatmap_out = head.output("center_heatmap");
-    const int num_classes = static_cast<int>(heatmap_out.shape[1]);
-    const int feat_h = static_cast<int>(heatmap_out.shape[2]);
-    const int feat_w = static_cast<int>(heatmap_out.shape[3]);
+    constexpr int num_classes = 3;
     const int HW = feat_h * feat_w;
 
-    auto heat_nms = local_maximum(heatmap_out.data, num_classes, feat_h, feat_w);
+    const auto& heatmap_data = pred.at("center_heatmap");
+
+    auto heat_nms = local_maximum(heatmap_data, num_classes, feat_h, feat_w);
     auto topk = get_topk(heat_nms, num_classes, feat_h, feat_w, TOPK);
 
-    const auto& wh = head.output("wh").data;
-    const auto& offset = head.output("offset").data;
-    const auto& alpha_cls_all = head.output("alpha_cls").data;
-    const auto& alpha_offset_all = head.output("alpha_offset").data;
-    const auto& depth_all = head.output("depth").data;
-    const auto& kpt_offset_all = head.output("center2kpt_offset").data;
-    const auto& dim_all = head.output("dim").data;
+    const auto& wh = pred.at("wh");
+    const auto& offset = pred.at("offset");
+    const auto& alpha_cls_all = pred.at("alpha_cls");
+    const auto& alpha_offset_all = pred.at("alpha_offset");
+    const auto& depth_all = pred.at("depth");
+    const auto& kpt_offset_all = pred.at("center2kpt_offset");
+    const auto& dim_all = pred.at("dim");
 
     const float x_scale = static_cast<float>(img_w) / feat_w;
     const float y_scale = static_cast<float>(img_h) / feat_h;
@@ -228,8 +269,7 @@ namespace monocon {
 
         detections.push_back(det);
     }
-
-    return detections;
+    return nms(std::move(detections), 0.5f);
 }
   
 

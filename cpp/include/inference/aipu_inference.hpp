@@ -39,7 +39,7 @@ namespace monocon {
     // single instance is enough to validate correctness first.
     class AipuInference {
     public:
-        explicit AipuInference(const std::string& model_dir, int num_cores = 4);
+        explicit AipuInference(const std::string& model_dir, int num_cores = 1);
         ~AipuInference();
 
         AipuInference(const AipuInference&) = delete;

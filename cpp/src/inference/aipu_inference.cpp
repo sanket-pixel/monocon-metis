@@ -37,8 +37,7 @@ namespace monocon {
             raw_output_infos_[i] = axr_get_model_output(model_, i);
             output_infos_[i] = to_tensor_info(raw_output_infos_[i]);
             output_memory_[i].resize(output_infos_[i].size_bytes);
-            output_args_[i] = axrArgument{output_memory_[i].data(), -1, 0, output_memory_[i].size()
-            };
+            output_args_[i] = axrArgument{output_memory_[i].data(), -1, 0, output_memory_[i].size()};
         }
     }
 
@@ -54,7 +53,7 @@ namespace monocon {
     AipuTensorInfo AipuInference::to_tensor_info(const axrTensorInfo& raw) const {
         AipuTensorInfo info;
         info.name = std::string(raw.name);
-        info.scale = raw.scale;      
+        info.scale = raw.scale;
         info.zero_point = raw.zero_point;
         info.size_bytes = axr_tensor_size(&raw);
         for (size_t d = 0; d < raw.ndims; ++d) {
@@ -63,11 +62,11 @@ namespace monocon {
 
             info.padded_shape.push_back(static_cast<int64_t>(raw.dims[d]));
             info.shape.push_back(static_cast<int64_t>(raw.dims[d]) - pad_before - pad_after);
-            info.padding.emplace_back(pad_before, pad_after); 
+            info.padding.emplace_back(pad_before, pad_after);
         }
         return info;
     }
-        
+
     void AipuInference::run() {
     auto result = axr_run_model_instance(
         instance_,
@@ -103,7 +102,7 @@ namespace monocon {
     int8_t* AipuInference::input_buffer(int index) {
         return input_memory_.at(index).data();
     }
-    
+
     const int8_t* AipuInference::output_buffer(int index) const {
         return output_memory_.at(index).data();
     }

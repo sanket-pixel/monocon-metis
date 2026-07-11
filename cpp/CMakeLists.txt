@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=native -g")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
+
 message(STATUS "──────────────────────────────────────────")
 message(STATUS "  MonoCon-Metis ${PROJECT_VERSION}")
 message(STATUS "──────────────────────────────────────────")
@@ -47,6 +51,7 @@ message(STATUS "  AxRuntime   : ${AXRUNTIME_ROOT}")
 
 find_package(OpenCV REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(Eigen3 REQUIRED)
 # ──────────────────────────────────────────────
 # ONNXRuntime (from Voyager SDK bundle)
 # ──────────────────────────────────────────────
@@ -108,18 +113,16 @@ set_target_properties(axruntime::axruntime PROPERTIES
 # ──────────────────────────────────────────────
 set(MONOCON_SOURCES
         # preprocess
-        src/preprocess/opencv_preprocess.cpp
-        src/preprocess/quantize.cpp
+        src/preprocess/fused_preprocess_quantize.cpp
 
         # inference
         src/inference/aipu_inference.cpp
-        src/inference/onnx_inference.cpp
         src/inference/backbone_neck.cpp
-        src/inference/head.cpp
 
         # postprocess
         src/postprocess/dequantize.cpp
         src/postprocess/decode.cpp
+        src/postprocess/head_tail_cpu.cpp
 
         # utils
         src/utils/visualize.cpp
@@ -142,6 +145,7 @@ target_link_libraries(monocon_cpp
         ${OpenCV_LIBS}
         onnxruntime::onnxruntime
         axruntime::axruntime
+        Eigen3::Eigen
 )
 target_link_libraries(monocon_cpp PUBLIC OpenMP::OpenMP_CXX)
 # ──────────────────────────────────────────────

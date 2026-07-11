@@ -1,32 +1,38 @@
+"""
+MonoCon prediction head — split at the AIPU/CPU boundary.
+
+AIPU boundary (compiled by Voyager, runs on Metis):
+    backbone + neck + HeadConv1Fused  →  (1, 576, H, W) single tensor
+
+CPU boundary (runs as HeadTailCPU in C++, exported to ONNX for reference):
+    HeadTail  →  10 named prediction tensors
+
+The split is forced by AttnBatchNorm2d: its ReduceMean op has no
+Voyager quantization converter, so anything containing it must stay on CPU.
+"""
+
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-
 from typing import Dict, Tuple
+
 from python.model.attentive_norm import AttnBatchNorm2d
 
-def make_head(out_channels: int) -> nn.Sequential:
-    """
-    Standard MonoCon prediction head: one 3x3 conv, one attentive-BN,
-    ReLU, then a 1x1 conv down to the target number of output channels.
-    Used ONLY by the original MonoConHead reference implementation below,
-    kept for verify_head_split.py's numerical-equivalence check.
-    """
-    return nn.Sequential(
-        nn.Conv2d(IN_CH, FEAT_CH, kernel_size=3, padding=1),
-        AttnBatchNorm2d(FEAT_CH, num_affine_trans=10, momentum=0.03, eps=0.001),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(FEAT_CH, out_channels, kernel_size=1))
-# Fixed constants for this project — MonoCon on KITTI, DLA-34 backbone.
-IN_CH = 64          # Channels coming in from the neck
-FEAT_CH = 64         # Internal channel width used inside every head
-NUM_CLASSES = 3      # Car, Pedestrian, Cyclist
-NUM_KPTS = 9         # 8 box corners + 1 projected 3D center
-NUM_ALPHA_BINS = 12  # Discretized observation-angle bins
 
-EPS = 1e-12
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-# Fixed order — every place that iterates heads must agree on this order,
-# since HeadConv1's output gets split back into per-head slices by index.
+IN_CH         = 64   # neck output channels
+FEAT_CH       = 64   # internal width of every head
+NUM_CLASSES   = 3    # Car, Pedestrian, Cyclist
+NUM_KPTS      = 9    # 8 box corners + projected 3D center
+NUM_ALPHA_BINS = 12  # observation-angle discretisation bins
+EPS           = 1e-12
+
+# Canonical head order — every consumer (export, C++ remap, weight dump)
+# must agree on this exact sequence.
 HEAD_NAMES: Tuple[str, ...] = (
     'heatmap', 'wh', 'offset', 'center2kpt_offset',
     'kpt_heatmap', 'kpt_heatmap_offset', 'dim', 'depth', 'dir_feat')
@@ -35,188 +41,196 @@ HEAD_OUT_CHANNELS: Tuple[int, ...] = (
     NUM_CLASSES, 2, 2, NUM_KPTS * 2, NUM_KPTS, 2, 3, 2, FEAT_CH)
 
 
-class HeadConv1(nn.Module):
+# ---------------------------------------------------------------------------
+# AIPU side: HeadConv1Fused
+# ---------------------------------------------------------------------------
+
+class HeadConv1Fused(nn.Module):
     """
-    The first, expensive 3x3 conv of every head — the part with NO
-    data-dependent runtime statistics, so it's pure CNN and belongs on
-    the AIPU alongside backbone+neck.
+    Nine independent 64→64 3×3 convs fused into one 64→576 conv.
+    Mathematically identical to running them separately (verified in
+    scripts/verify_head_conv1_fusion.py — max diff 0.0).
 
-    Each head's first conv is architecturally identical (64 -> 64, 3x3),
-    so they're kept as 9 separate Conv2d modules here (matching the
-    original checkpoint's per-head layer names exactly) but run back-to-back
-    on the same input — a compiler/exporter can still fuse these into one
-    wider conv if beneficial; keeping them separate here just guarantees
-    the state_dict keys match the original MonoConHead exactly.
+    Output: (1, 576, H, W) — a single tensor, no dict.
+    Channel block i (i*64 : (i+1)*64) corresponds to HEAD_NAMES[i].
 
-    ~9 x (96 x 312 x 64 x 64 x 3x3) MACs ~= 20 GFLOPs total — this is
-    roughly 2/3 of the entire backbone+neck's compute, NOT a trivial
-    afterthought. This is why it belongs on the AIPU, not on CPU.
+    Single output avoids the alphabetical-reordering quirk Voyager's
+    compiler applies to multi-output graphs.
     """
 
     def __init__(self):
         super().__init__()
+        self.fused_conv1 = nn.Conv2d(IN_CH, FEAT_CH * len(HEAD_NAMES),
+                                     kernel_size=3, padding=1)
 
-        for name in HEAD_NAMES:
-            setattr(self, f'{name}_conv1', nn.Conv2d(IN_CH, FEAT_CH, kernel_size=3, padding=1))
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.fused_conv1(feat)
 
-    def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def load_from_checkpoint(self, model_state: dict) -> None:
         """
-        Args:
-            feat: (B, 64, H/4, W/4) fused feature map from the neck.
-
-        Returns:
-            Dict of 9 tensors, each (B, 64, H/4, W/4) — the pre-normalization
-            feature map for each head, ready for HeadTail.
+        Loads weights from a raw monocon-pytorch checkpoint state dict.
+        Stacks the 9 per-head conv1 weight tensors into the fused layout.
         """
-        return {name: getattr(self, f'{name}_conv1')(feat) for name in HEAD_NAMES}
+        # Build a temporary unfused module to leverage its clean key structure
+        unfused = _HeadConv1Unfused()
+        conv1_state = _extract_conv1_state(model_state)
+        unfused.load_state_dict(conv1_state, strict=True)
 
+        weights = torch.cat(
+            [getattr(unfused, f'{n}_conv1').weight.data for n in HEAD_NAMES], dim=0)
+        biases = torch.cat(
+            [getattr(unfused, f'{n}_conv1').bias.data for n in HEAD_NAMES], dim=0)
+        self.fused_conv1.weight.data.copy_(weights)
+        self.fused_conv1.bias.data.copy_(biases)
+
+
+# ---------------------------------------------------------------------------
+# CPU side: HeadTail
+# ---------------------------------------------------------------------------
 
 class HeadTail(nn.Module):
     """
-    Everything AFTER each head's first conv: the data-dependent
-    AttnBatchNorm2d (runtime ReduceMean + MatMul — cannot be quantized,
-    cannot be folded, cannot run on the AIPU), ReLU, and the cheap 1x1
-    second conv. This stays FP32 on CPU via ONNXRuntime.
+    AttnBatchNorm2d + ReLU + 1×1 conv for each head.
 
-    Takes HeadConv1's 9 output tensors and produces the final named
-    prediction dict that decode.py expects — identical output contract
-    to the original single-module MonoConHead.
+    Input:  (1, 576, H, W) — the AIPU's fused HeadConv1 output.
+    Output: dict of 10 named prediction tensors for decode.py.
+
+    AttnBatchNorm2d contains ReduceMean (data-dependent runtime stats)
+    which Voyager cannot quantize — this class must stay on CPU.
+    Exported to ONNX for reference; the deployed C++ pipeline uses
+    HeadTailCPU (cpp/src/postprocess/head_tail_cpu.cpp) instead of ORT.
     """
 
     def __init__(self):
         super().__init__()
 
         self.attn_bns = nn.ModuleDict({
-            name: AttnBatchNorm2d(FEAT_CH, num_affine_trans=10, momentum=0.03, eps=0.001)
+            name: AttnBatchNorm2d(FEAT_CH, num_affine_trans=10,
+                                  momentum=0.03, eps=0.001)
             for name in HEAD_NAMES})
 
         self.relu = nn.ReLU(inplace=True)
 
         for name, out_ch in zip(HEAD_NAMES, HEAD_OUT_CHANNELS):
             if name == 'dir_feat':
-                continue  # dir_feat's "conv2" is actually dir_cls/dir_reg, handled separately
-            setattr(self, f'{name}_conv2', nn.Conv2d(FEAT_CH, out_ch, kernel_size=1))
+                continue
+            setattr(self, f'{name}_conv2',
+                    nn.Conv2d(FEAT_CH, out_ch, kernel_size=1))
 
+        # dir_feat has two output branches instead of one conv2
         self.dir_cls = nn.Sequential(nn.Conv2d(FEAT_CH, NUM_ALPHA_BINS, kernel_size=1))
         self.dir_reg = nn.Sequential(nn.Conv2d(FEAT_CH, NUM_ALPHA_BINS, kernel_size=1))
 
-    def forward(self, conv1_out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            conv1_out: dict of 9 tensors from HeadConv1, one per HEAD_NAMES entry.
+    def forward(self, fused_conv1_out: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Split 576-channel AIPU output back into 9 per-head (1,64,H,W) slices
+        conv1_out = {
+            name: fused_conv1_out[:, i * FEAT_CH:(i + 1) * FEAT_CH]
+            for i, name in enumerate(HEAD_NAMES)}
 
-        Returns:
-            Dict of 10 final named prediction tensors — same keys/shapes
-            as the original MonoConHead.forward(), ready for decode.py.
-        """
-        normed = {name: self.relu(self.attn_bns[name](conv1_out[name])) for name in HEAD_NAMES}
+        normed = {
+            name: self.relu(self.attn_bns[name](conv1_out[name]))
+            for name in HEAD_NAMES}
 
-        heatmap = self.heatmap_conv2(normed['heatmap'])
-        wh = self.wh_conv2(normed['wh'])
-        offset = self.offset_conv2(normed['offset'])
+        heatmap           = self.heatmap_conv2(normed['heatmap'])
+        wh                = self.wh_conv2(normed['wh'])
+        offset            = self.offset_conv2(normed['offset'])
         center2kpt_offset = self.center2kpt_offset_conv2(normed['center2kpt_offset'])
-        kpt_heatmap = self.kpt_heatmap_conv2(normed['kpt_heatmap'])
+        kpt_heatmap       = self.kpt_heatmap_conv2(normed['kpt_heatmap'])
         kpt_heatmap_offset = self.kpt_heatmap_offset_conv2(normed['kpt_heatmap_offset'])
-        dim = self.dim_conv2(normed['dim'])
-        depth_raw = self.depth_conv2(normed['depth'])
-
-        alpha_cls = self.dir_cls(normed['dir_feat'])
-        alpha_offset = self.dir_reg(normed['dir_feat'])
+        dim               = self.dim_conv2(normed['dim'])
+        depth_raw         = self.depth_conv2(normed['depth'])
+        alpha_cls         = self.dir_cls(normed['dir_feat'])
+        alpha_offset      = self.dir_reg(normed['dir_feat'])
 
         heat_min, heat_max = 1e-4, 1. - 1e-4
         center_heatmap = torch.clamp(torch.sigmoid(heatmap), heat_min, heat_max)
-        kpt_heatmap = torch.clamp(torch.sigmoid(kpt_heatmap), heat_min, heat_max)
+        kpt_heatmap    = torch.clamp(torch.sigmoid(kpt_heatmap), heat_min, heat_max)
 
-        depth_value = (1. / (torch.sigmoid(depth_raw[:, 0:1]) + EPS)) - 1
-        depth_log_var = depth_raw[:, 1:2]
-        depth = torch.cat([depth_value, depth_log_var], dim=1)
+        depth = torch.cat([
+            (1. / (torch.sigmoid(depth_raw[:, 0:1]) + EPS)) - 1,
+            depth_raw[:, 1:2]], dim=1)
 
         return {
-            'center_heatmap': center_heatmap,
-            'kpt_heatmap': kpt_heatmap,
-            'wh': wh,
-            'offset': offset,
+            'center_heatmap':    center_heatmap,
+            'kpt_heatmap':       kpt_heatmap,
+            'wh':                wh,
+            'offset':            offset,
             'kpt_heatmap_offset': kpt_heatmap_offset,
             'center2kpt_offset': center2kpt_offset,
-            'dim': dim,
-            'depth': depth,
-            'alpha_cls': alpha_cls,
-            'alpha_offset': alpha_offset}
+            'dim':               dim,
+            'depth':             depth,
+            'alpha_cls':         alpha_cls,
+            'alpha_offset':      alpha_offset}
 
 
-class MonoConHeadSplit(nn.Module):
+# ---------------------------------------------------------------------------
+# Combined: MonoConHead (PyTorch-only, for checkpoint loading + sanity checks)
+# ---------------------------------------------------------------------------
+
+class MonoConHead(nn.Module):
     """
-    Combines HeadConv1 + HeadTail for use in plain PyTorch (e.g. loading
-    a checkpoint, running a sanity-check forward pass). For actual
-    deployment, HeadConv1 gets exported as part of the AIPU graph and
-    HeadTail gets exported separately for ONNXRuntime CPU — see export.py.
+    Full head for use in Python only (checkpoint loading, verification,
+    ONNX export). Not used in the deployed C++ pipeline.
+
+    forward() runs HeadConv1Fused → HeadTail in sequence.
     """
 
     def __init__(self):
         super().__init__()
-        self.conv1 = HeadConv1()
-        self.tail = HeadTail()
+        self.conv1 = HeadConv1Fused()
+        self.tail  = HeadTail()
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.tail(self.conv1(feat))
 
-class MonoConHead(nn.Module):
-    """
-    Original, unsplit reference implementation — kept here ONLY for
-    verify_head_split.py to diff against. Not used in the actual deployed
-    pipeline; HeadConv1 + HeadTail (via MonoConHeadSplit) is what gets
-    exported and deployed.
-    """
+    def load_from_checkpoint(self, model_state: dict) -> None:
+        self.conv1.load_from_checkpoint(model_state)
+        tail_state = _extract_tail_state(model_state)
+        self.tail.load_state_dict(tail_state, strict=True)
 
+
+# ---------------------------------------------------------------------------
+# Private helpers — checkpoint key remapping
+# ---------------------------------------------------------------------------
+
+class _HeadConv1Unfused(nn.Module):
+    """
+    Temporary unfused form used only during checkpoint loading.
+    Keys match the original monocon-pytorch state dict exactly.
+    Never exported, never instantiated outside HeadConv1Fused.load_from_checkpoint.
+    """
     def __init__(self):
         super().__init__()
+        for name in HEAD_NAMES:
+            setattr(self, f'{name}_conv1',
+                    nn.Conv2d(IN_CH, FEAT_CH, kernel_size=3, padding=1))
 
-        self.heatmap_head = make_head(NUM_CLASSES)
-        self.wh_head = make_head(2)
-        self.offset_head = make_head(2)
-        self.center2kpt_offset_head = make_head(NUM_KPTS * 2)
-        self.kpt_heatmap_head = make_head(NUM_KPTS)
-        self.kpt_heatmap_offset_head = make_head(2)
-        self.dim_head = make_head(3)
-        self.depth_head = make_head(2)
 
-        self.dir_feat = nn.Sequential(
-            nn.Conv2d(IN_CH, FEAT_CH, kernel_size=3, padding=1),
-            AttnBatchNorm2d(FEAT_CH, num_affine_trans=10, momentum=0.03, eps=0.001),
-            nn.ReLU(inplace=True))
-        self.dir_cls = nn.Sequential(nn.Conv2d(FEAT_CH, NUM_ALPHA_BINS, kernel_size=1))
-        self.dir_reg = nn.Sequential(nn.Conv2d(FEAT_CH, NUM_ALPHA_BINS, kernel_size=1))
+def _extract_conv1_state(model_state: dict) -> dict:
+    """Maps original head.{name}_head.0.* keys → {name}_conv1.* keys."""
+    state = {}
+    for name in HEAD_NAMES:
+        prefix = 'dir_feat' if name == 'dir_feat' else f'{name}_head'
+        state[f'{name}_conv1.weight'] = model_state[f'head.{prefix}.0.weight']
+        state[f'{name}_conv1.bias']   = model_state[f'head.{prefix}.0.bias']
+    return state
 
-    def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        heat_min, heat_max = 1e-4, 1. - 1e-4
-        center_heatmap = torch.clamp(torch.sigmoid(self.heatmap_head(feat)), heat_min, heat_max)
-        kpt_heatmap = torch.clamp(torch.sigmoid(self.kpt_heatmap_head(feat)), heat_min, heat_max)
 
-        wh = self.wh_head(feat)
-        offset = self.offset_head(feat)
-        kpt_heatmap_offset = self.kpt_heatmap_offset_head(feat)
-        center2kpt_offset = self.center2kpt_offset_head(feat)
+def _extract_tail_state(model_state: dict) -> dict:
+    """Maps original head.{name}_head.1.* keys → attn_bns.{name}.* keys."""
+    state = {}
+    for name in HEAD_NAMES:
+        prefix = 'dir_feat' if name == 'dir_feat' else f'{name}_head'
+        attn_prefix = f'head.{prefix}.1.'
+        for k, v in model_state.items():
+            if k.startswith(attn_prefix):
+                state[f'attn_bns.{name}.{k[len(attn_prefix):]}'] = v
+        if name != 'dir_feat':
+            state[f'{name}_conv2.weight'] = model_state[f'head.{prefix}.3.weight']
+            state[f'{name}_conv2.bias']   = model_state[f'head.{prefix}.3.bias']
 
-        dim = self.dim_head(feat)
-
-        depth_raw = self.depth_head(feat)
-        depth_value = (1. / (torch.sigmoid(depth_raw[:, 0:1]) + EPS)) - 1
-        depth_log_var = depth_raw[:, 1:2]
-        depth = torch.cat([depth_value, depth_log_var], dim=1)
-
-        alpha_feat = self.dir_feat(feat)
-        alpha_cls = self.dir_cls(alpha_feat)
-        alpha_offset = self.dir_reg(alpha_feat)
-
-        return {
-            'center_heatmap': center_heatmap,
-            'kpt_heatmap': kpt_heatmap,
-            'wh': wh,
-            'offset': offset,
-            'kpt_heatmap_offset': kpt_heatmap_offset,
-            'center2kpt_offset': center2kpt_offset,
-            'dim': dim,
-            'depth': depth,
-            'alpha_cls': alpha_cls,
-            'alpha_offset': alpha_offset}
-
+    state['dir_cls.0.weight'] = model_state['head.dir_cls.0.weight']
+    state['dir_cls.0.bias']   = model_state['head.dir_cls.0.bias']
+    state['dir_reg.0.weight'] = model_state['head.dir_reg.0.weight']
+    state['dir_reg.0.bias']   = model_state['head.dir_reg.0.bias']
+    return state
