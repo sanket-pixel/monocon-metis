@@ -2,11 +2,19 @@
 
 End-to-end 3D object detection from a single camera, running entirely on an
 Axelera Metis M.2 AIPU single core + CPU host, no GPU required at inference time
-Running at ~25 FPS end to end with single core, no latency , no batching.
+Running at 24.5 FPS end to end with single core, no latency , no batching.
 
 ![Demo](data/kitti.gif)
 
----
+## Features
+
+- [x] 24.5 FPS end-to-end pipelined throughput on a single AIPU core
+- [x] Full 3D bounding box prediction — position, dimensions, orientation
+- [x] Custom C++ `HeadTailCPU` — zero ONNXRuntime dependency at inference time
+- [x] Fused preprocess + quantize — single pass, no float32 intermediate buffer
+- [x] Producer-consumer pipeline — AIPU and CPU run concurrently across frames
+- [x] `make export / compile / build / run / profile / video` — full pipeline in one command
+- [x] Verified numerically at every split point against FP32 PyTorch reference
 
 ## 1. Results
 
