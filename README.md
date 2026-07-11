@@ -1,8 +1,8 @@
 # Monocular 3D Object Detection on Axelera Metis
 
-> End-to-end 3D object detection from a single camera, running entirely on an
-> Axelera Metis M.2 AIPU single core + CPU host, no GPU required at inference time
-> Running at ~25 FPS end to end with single core, no latency , no batching.
+End-to-end 3D object detection from a single camera, running entirely on an
+Axelera Metis M.2 AIPU single core + CPU host, no GPU required at inference time
+Running at ~25 FPS end to end with single core, no latency , no batching.
 
 ![Demo](data/kitti.gif)
 
@@ -271,7 +271,7 @@ Throughput FPS:  24.5
 
 ## Challenges
 
-Six non-obvious problems encountered during deployment, none of them
+Five non-obvious problems encountered during deployment, none of them
 documented in the Voyager SDK. Recorded here so the next person doesn't
 spend weeks on the same issues.
 
@@ -362,7 +362,7 @@ in C++. All weights loaded once at construction. All scratch buffers
 preallocated. Nine heads processed in parallel via OpenMP.
 Zero heap allocation per frame. Result: **22 ms** — a **2.7× improvement**.
 
-### 7. Closing the gap between sequential and pipelined throughput
+### 5. Closing the gap between sequential and pipelined throughput
 
 **Observation:** After all per-stage optimisations, the sequential
 pipeline measured **62 ms/frame (16 FPS)**. The AIPU and CPU host were
